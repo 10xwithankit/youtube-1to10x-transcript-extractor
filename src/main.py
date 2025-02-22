@@ -1,115 +1,125 @@
-"""This module defines the main entry point for the Apify Actor.
-
-Feel free to modify this file to suit your specific needs.
-
-To build Apify Actors, utilize the Apify SDK toolkit, read more at the official documentation:
-https://docs.apify.com/sdk/python
-"""
-
+import json
+import time
+import random
+import os
 import asyncio
-from urllib.parse import urljoin
-
-from apify import Actor, Request
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options as ChromeOptions
+from apify import Actor
+from youtube_transcript_api import YouTubeTranscriptApi
+import yt_dlp
+from seleniumwire import webdriver
 from selenium.webdriver.common.by import By
-
-# To run this Actor locally, you need to have the Selenium Chromedriver installed.
-# Follow the installation guide at:
-# https://www.selenium.dev/documentation/webdriver/getting_started/install_drivers/
-# When running on the Apify platform, the Chromedriver is already included
-# in the Actor's Docker image.
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 
-async def main() -> None:
-    """Main entry point for the Apify Actor.
+async def get_transcript_api(video_id):
+    """Try fetching transcript via YouTube API"""
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        return json.dumps(transcript, indent=2)
+    except Exception as e:
+        Actor.log.info(f"API Method Failed: {e}")
+        return None
 
-    This coroutine is executed using `asyncio.run()`, so it must remain an asynchronous function for proper execution.
-    Asynchronous execution is required for communication with Apify platform, and it also enhances performance in
-    the field of web scraping significantly.
-    """
-    # Enter the context of the Actor.
-    async with Actor:
-        # Retrieve the Actor input, and use default values if not provided.
-        actor_input = await Actor.get_input() or {}
-        start_urls = actor_input.get('start_urls', [{'url': 'https://apify.com'}])
-        max_depth = actor_input.get('max_depth', 1)
 
-        # Exit if no start URLs are provided.
-        if not start_urls:
-            Actor.log.info('No start URLs specified in actor input, exiting...')
-            await Actor.exit()
+async def get_transcript_yt_dlp(video_id):
+    """Fallback to yt-dlp with Apify Proxy"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'proxy': 'http://proxy.apify.com:8000',  # Using Apify Proxy
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            return json.dumps(info.get('automatic_captions', {}), indent=2)
+    except Exception as e:
+        Actor.log.info(f"yt-dlp Failed: {e}")
+        return None
 
-        # Open the default request queue for handling URLs to be processed.
-        request_queue = await Actor.open_request_queue()
 
-        # Enqueue the start URLs with an initial crawl depth of 0.
-        for start_url in start_urls:
-            url = start_url.get('url')
-            Actor.log.info(f'Enqueuing {url} ...')
-            new_request = Request.from_url(url, user_data={'depth': 0})
-            await request_queue.add_request(new_request)
+async def get_transcript_selenium(video_id):
+    """Use Selenium to extract transcript if everything else fails"""
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280x720")
 
-        # Launch a new Selenium Chrome WebDriver and configure it.
-        Actor.log.info('Launching Chrome WebDriver...')
-        chrome_options = ChromeOptions()
+    driver = webdriver.Chrome(options=options)
+    driver.get(f"https://www.youtube.com/watch?v={video_id}")
 
-        if Actor.config.headless:
-            chrome_options.add_argument('--headless')
+    try:
+        # Wait for transcript button
+        element = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "ytp-subtitles-button"))
+        )
+        element.click()
 
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        driver = webdriver.Chrome(options=chrome_options)
-
-        # Test WebDriver setup by navigating to an example page.
-        driver.get('http://www.example.com')
-        if driver.title != 'Example Domain':
-            raise ValueError('Failed to open example page.')
-
-        # Process the URLs from the request queue.
-        while request := await request_queue.fetch_next_request():
-            url = request.url
-
-            if not isinstance(request.user_data['depth'], (str, int)):
-                raise TypeError('Request.depth is an enexpected type.')
-
-            depth = int(request.user_data['depth'])
-            Actor.log.info(f'Scraping {url} (depth={depth}) ...')
-
-            try:
-                # Navigate to the URL using Selenium WebDriver. Use asyncio.to_thread
-                # for non-blocking execution.
-                await asyncio.to_thread(driver.get, url)
-
-                # If the current depth is less than max_depth, find nested links
-                # and enqueue them.
-                if depth < max_depth:
-                    for link in driver.find_elements(By.TAG_NAME, 'a'):
-                        link_href = link.get_attribute('href')
-                        link_url = urljoin(url, link_href)
-
-                        if link_url.startswith(('http://', 'https://')):
-                            Actor.log.info(f'Enqueuing {link_url} ...')
-                            new_request = Request.from_url(
-                                link_url,
-                                user_data={'depth': depth + 1},
-                            )
-                            await request_queue.add_request(new_request)
-
-                # Extract the desired data.
-                data = {
-                    'url': url,
-                    'title': driver.title,
-                }
-
-                # Store the extracted data to the default dataset.
-                await Actor.push_data(data)
-
-            except Exception:
-                Actor.log.exception(f'Cannot extract data from {url}.')
-
-            finally:
-                # Mark the request as handled to ensure it is not processed again.
-                await request_queue.mark_request_as_handled(request)
-
+        # Wait for captions
+        time.sleep(random.uniform(5, 10))
+        transcript = driver.page_source
+        return transcript
+    except Exception as e:
+        Actor.log.info(f"Selenium Failed: {e}")
+        return None
+    finally:
         driver.quit()
+
+
+async def main():
+    """Main Apify Actor function"""
+    await Actor.init()  # Ensure Actor is initialized properly
+
+    input_data = await Actor.get_input() or {}
+    # Extract video ID from start_urls
+    start_urls = input_data.get("start_urls", [])
+    video_id = None
+
+    if start_urls:
+        first_url = start_urls[0].get("url", "")
+        if "watch?v=" in first_url:
+            video_id = first_url.split("watch?v=")[-1].split("&")[0]  # Extract video ID
+
+    if not video_id:
+        Actor.log.error("No video_id provided!")
+        return
+
+
+    if not video_id:
+        Actor.log.error("No video_id provided!")
+        return
+
+    transcript = (
+        await get_transcript_api(video_id) or
+        await get_transcript_yt_dlp(video_id) or
+        await get_transcript_selenium(video_id)
+    )
+
+
+    if transcript:
+        Actor.log.info("Transcript Extracted Successfully!")
+
+        # Save transcript to Apify storage
+        await Actor.set_value("OUTPUT", transcript)  # Saves in Apify storage
+        Actor.log.info("Transcript saved in Apify storage as OUTPUT.json")
+
+        # Explicitly save transcript to local file system
+        output_path = "apify_storage/key_value_stores/default/OUTPUT.json"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)  # Ensure the directory exists
+
+        with open(output_path, "w") as f:
+            json.dump(transcript, f, indent=2)
+
+        Actor.log.info(f"Transcript explicitly saved to {output_path}")
+
+    else:
+        Actor.log.error("Failed to extract transcript")
+
+    await Actor.exit()
+
+
+
+# Run Apify Actor correctly
+if __name__ == "__main__":
+    asyncio.run(main())
